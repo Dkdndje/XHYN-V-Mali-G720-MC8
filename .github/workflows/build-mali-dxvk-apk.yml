@@ -7,7 +7,7 @@ on:
         description: Direct source APK URL
         required: true
         type: string
-        default: https://tmpfiles.org/dl/1790880498.08dfc23730a4071d/wuAUAemmwhea/xhyn-v-final.apk
+        default: https://store3.gofile.io/download/web/84987b15-395f-4656-bc5c-5e16d691af3c/XHYN-V-final.apk
 
 jobs:
   build:
@@ -16,7 +16,6 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-
       - name: Download and validate source APK
         run: |
           set -euo pipefail
@@ -26,14 +25,6 @@ jobs:
           file input.apk | tee report/input-file.txt
           test "$(stat -c%s input.apk)" -gt 1000000
           unzip -tq input.apk
-          python3 - <<'PY'
-          import zipfile
-          with zipfile.ZipFile("input.apk") as z:
-              names=z.namelist()
-              assert names, "APK ZIP is empty"
-              assert any(n.startswith("lib/arm64-v8a/") for n in names), "No arm64-v8a native libraries"
-          print("APK ZIP validation: OK")
-          PY
           unzip -q input.apk -d apk
           cp -a apk/. patched/
           find apk/lib/arm64-v8a -type f -name '*.so' -print | sort | tee report/native-libs.txt
@@ -41,7 +32,6 @@ jobs:
           while IFS= read -r f; do
             strings -a "$f" | grep -E 'fillModeNonSolid|No adapters found|Failed to initialize DXVK|Adreno|KGSL|DXVK' || true
           done < report/native-libs.txt | tee report/relevant-strings.txt
-
       - name: Apply only verified textual DXVK requirement patch
         run: |
           set -euo pipefail
@@ -53,40 +43,28 @@ jobs:
           import sys,re
           p=sys.argv[1]
           s=open(p,encoding="utf-8").read()
-          n=len(re.findall(r'("fillModeNonSolid"\s*:\s*)true',s))
           s2=re.sub(r'("fillModeNonSolid"\s*:\s*)true',r'\1false',s)
           open(p,"w",encoding="utf-8").write(s2)
-          print(f"{p}: textual replacements={n}")
+          print(p)
           PY
-              if cmp -s "$f" "$f.bak"; then
-                rm -f "$f.bak"
-              else
-                changed=$((changed+1))
-                rm -f "$f.bak"
-              fi
+              if ! cmp -s "$f" "$f.bak"; then changed=$((changed+1)); fi
+              rm -f "$f.bak"
             fi
           done
           echo "textual_patch_count=$changed" | tee report/patch.txt
           if [ "$changed" -eq 0 ]; then
             echo "NO_SAFE_TEXTUAL_PATCH_FOUND" | tee -a report/patch.txt
-            echo "The runtime requirement appears to be embedded in native code; no blind binary patch will be applied." | tee -a report/patch.txt
           fi
-
       - name: Repack only if a safe textual patch was found
-        if: success()
         run: |
           set -euo pipefail
-          if ! grep -q '^textual_patch_count=[1-9][0-9]*$' report/patch.txt; then
-            echo "No APK generated because no verified textual DXVK requirement was found."
-            exit 0
-          fi
+          if ! grep -q '^textual_patch_count=[1-9][0-9]*$' report/patch.txt; then exit 0; fi
           (cd patched && zip -q -r -9 ../rebuilt-unsigned.apk .)
           zipalign -f 4 rebuilt-unsigned.apk rebuilt-aligned.apk
           keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=Android Debug,O=Android,C=US' >/dev/null 2>&1
           apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out rebuilt.apk rebuilt-aligned.apk
           apksigner verify --verbose rebuilt.apk
           sha256sum rebuilt.apk | tee report/rebuilt.sha256
-
       - name: Upload analysis
         uses: actions/upload-artifact@v4
         with:
