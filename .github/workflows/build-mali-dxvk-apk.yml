@@ -1,0 +1,81 @@
+name: Build Mali-G720 DXVK APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: Direct source APK URL
+        required: true
+        type: string
+        default: https://tmpfiles.org/dl/1790880498.08dfc23730a4071d/wuAUAemmwhea/xhyn-v-final.apk
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download source APK
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 "${{ inputs.apk_url }}" -o input.apk
+          sha256sum input.apk
+      - name: Extract and locate DXVK binaries
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip zip zipalign apksigner binutils llvm python3
+          rm -rf apk patched report
+          mkdir -p apk patched report
+          unzip -q input.apk -d apk
+          find apk/lib/arm64-v8a -type f -name '*.so' -print | sort | tee report/native-libs.txt
+          echo '=== fillModeNonSolid owners ===' | tee report/fillmode.txt
+          grep -IlZ 'fillModeNonSolid' apk/lib/arm64-v8a/*.so 2>/dev/null | tr '\\0' '\\n' | tee -a report/fillmode.txt || true
+          for f in apk/lib/arm64-v8a/*.so; do
+            if strings -a "$f" | grep -q 'fillModeNonSolid'; then
+              echo "--- $f ---" | tee -a report/fillmode.txt
+              strings -a -t x "$f" | grep -E 'fillModeNonSolid|No adapters found|Failed to initialize DXVK' | head -50 | tee -a report/fillmode.txt || true
+              llvm-readelf -h "$f" >> report/$(basename "$f").elf.txt 2>&1 || true
+            fi
+          done
+      - name: Verify patchable source/config before modification
+        run: |
+          set -euo pipefail
+          cp -a apk/. patched/
+          echo 'This build never performs blind byte replacement.' | tee report/patch.txt
+          echo 'Only an exact textual DXVK requirements/config file is patched automatically.' | tee -a report/patch.txt
+          changed=0
+          while IFS= read -r -d '' f; do
+            if grep -q 'fillModeNonSolid' "$f" 2>/dev/null; then
+              cp "$f" "$f.bak"
+              sed -i -E 's/("fillModeNonSolid"[[:space:]]*:[[:space:]]*)true/\\1false/g' "$f"
+              if ! cmp -s "$f" "$f.bak"; then changed=1; echo "patched=$f" | tee -a report/patch.txt; fi
+              rm -f "$f.bak"
+            fi
+          done < <(find patched -type f -name '*.json' -print0)
+          echo "textual_patch_count=$changed" | tee -a report/patch.txt
+          if [ "$changed" -eq 0 ]; then
+            echo 'NO_SAFE_TEXTUAL_PATCH_FOUND' | tee -a report/patch.txt
+            echo 'The APK contains the requirement in native code; stop rather than corrupting the binary.' | tee -a report/patch.txt
+          fi
+      - name: Repack only when a verified textual patch exists
+        if: hashFiles('report/patch.txt') != ''
+        run: |
+          set -euo pipefail
+          if ! grep -q '^textual_patch_count=1' report/patch.txt; then exit 0; fi
+          (cd patched && zip -q -r9 ../rebuilt-unsigned.apk .)
+          zipalign -f 4 rebuilt-unsigned.apk rebuilt-aligned.apk
+          keytool -genkeypair -v -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=Android Debug,O=Android,C=US' >/dev/null 2>&1 || true
+          apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out rebuilt.apk rebuilt-aligned.apk
+          apksigner verify --verbose rebuilt.apk
+          sha256sum rebuilt.apk | tee report/rebuilt.sha256
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: mali-g720-dxvk-analysis
+          path: |
+            input.apk
+            report/
+            rebuilt.apk
+          retention-days: 7
