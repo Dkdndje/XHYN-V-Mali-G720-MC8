@@ -1,0 +1,112 @@
+name: Deep Mali DXVK Binary Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: Direct APK URL
+        required: true
+        type: string
+        default: https://tmpfiles.org/dl/1790880498.08dfc23730a4071d/wuAUAemmwhea/xhyn-v-final.apk
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APK
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 "${{ inputs.apk_url }}" -o input.apk
+          sha256sum input.apk
+
+      - name: Install analysis tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip binutils llvm python3 python3-pip
+          python3 -m pip install --break-system-packages pyelftools capstone
+
+      - name: Extract and locate DXVK requirement
+        run: |
+          set -euo pipefail
+          rm -rf apk report
+          mkdir -p apk report
+          unzip -q input.apk -d apk
+          echo "=== Native libraries ===" | tee report/native.txt
+          find apk/lib/arm64-v8a -type f -name '*.so' -print | sort | tee -a report/native.txt
+          echo "=== fillModeNonSolid owners ===" | tee report/owners.txt
+          while IFS= read -r -d '' f; do
+            if strings -a "$f" | grep -q 'fillModeNonSolid'; then
+              echo "$f" | tee -a report/owners.txt
+            fi
+          done < <(find apk/lib/arm64-v8a -type f -name '*.so' -print0)
+
+      - name: Analyze AArch64 string cross references
+        run: |
+          set -euo pipefail
+          cat > analyze.py <<'PY'
+          import os, re, struct, subprocess, json
+          from elftools.elf.elffile import ELFFile
+          from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+
+          OUT=[]
+          for root,_,files in os.walk("apk/lib/arm64-v8a"):
+            for fn in files:
+              if not fn.endswith(".so"): continue
+              path=os.path.join(root,fn)
+              try:
+                with open(path,"rb") as f:
+                  elf=ELFFile(f)
+                  targets=[]
+                  for sec in elf.iter_sections():
+                    if not sec.is_elf_hash() and sec['sh_type'] == 'SHT_PROGBITS' and (sec['sh_flags'] & 2):
+                      data=sec.data()
+                      needle=b"fillModeNonSolid\\x00"
+                      pos=0
+                      while True:
+                        p=data.find(needle,pos)
+                        if p<0: break
+                        targets.append((sec['sh_addr']+p, sec['sh_offset']+p, sec.name))
+                        pos=p+1
+                  if not targets: continue
+                  textsec=elf.get_section_by_name('.text')
+                  if textsec is None: continue
+                  text=textsec.data()
+                  text_va=textsec['sh_addr']
+                  md=Cs(CS_ARCH_ARM64,CS_MODE_ARM)
+                  md.detail=True
+                  ins=list(md.disasm(text,text_va))
+                  for va,off,secname in targets:
+                    nearby=[]
+                    # Search instructions that materialize the target address using ADR/ADRP+ADD,
+                    # and literal loads within a small window. We keep this diagnostic-only.
+                    for i,x in enumerate(ins):
+                      if abs(x.address-va) > 0x200000: continue
+                      if x.mnemonic in ("adr","adrp") and hex(va) in x.op_str:
+                        nearby.append((hex(x.address),x.mnemonic,x.op_str))
+                    OUT.append({"file":path,"string_va":hex(va),"file_offset":hex(off),"section":secname,"nearby":nearby[:20]})
+              except Exception as e:
+                OUT.append({"file":path,"error":repr(e)})
+          print(json.dumps(OUT,indent=2))
+          open("report/crossrefs.json","w").write(json.dumps(OUT,indent=2))
+          PY
+          python3 analyze.py | tee report/crossrefs.txt
+
+      - name: Disassemble likely DXVK libraries
+        run: |
+          set -euo pipefail
+          : > report/disassembly.txt
+          while read -r f; do
+            [ -f "$f" ] || continue
+            echo "===== $f =====" | tee -a report/disassembly.txt
+            llvm-objdump -d --no-show-raw-insn "$f" 2>/dev/null | grep -Ei -B20 -A40 'fillModeNonSolid|No adapters found|DXVK' | head -500 | tee -a report/disassembly.txt || true
+          done < report/owners.txt
+
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: xhyn-deep-mali-analysis
+          path: |
+            input.apk
+            report/
+          retention-days: 7
