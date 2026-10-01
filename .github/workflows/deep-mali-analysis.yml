@@ -7,7 +7,7 @@ on:
         description: Direct APK URL
         required: true
         type: string
-        default: https://tmpfiles.org/dl/1790880498.08dfc23730a4071d/wuAUAemmwhea/xhyn-v-final.apk
+        default: https://store3.gofile.io/download/web/84987b15-395f-4656-bc5c-5e16d691af3c/XHYN-V-final.apk
 
 jobs:
   analyze:
@@ -22,75 +22,41 @@ jobs:
           file input.apk
           test "$(stat -c%s input.apk)" -gt 1000000
           unzip -tq input.apk
-          python3 - <<'PY'
-          import zipfile
-          with zipfile.ZipFile("input.apk") as z:
-              names=z.namelist()
-              assert names, "APK ZIP is empty"
-              assert any(n.startswith("lib/arm64-v8a/") for n in names), "No arm64-v8a native libraries"
-          print("APK ZIP validation: OK")
-          PY
           unzip -q input.apk -d apk
           test -d apk/lib/arm64-v8a
+          find apk/lib/arm64-v8a -type f -name '*.so' -print | sort | tee report/arm64-libs.txt
 
       - name: Install analysis tools
         run: |
           set -euo pipefail
           python3 -m pip install --break-system-packages pyelftools capstone
 
-      - name: Inventory native libraries
+      - name: Scan native libraries
         run: |
           set -euo pipefail
-          find apk/lib/arm64-v8a -type f -name '*.so' -print | sort | tee report/arm64-libs.txt
           while IFS= read -r f; do
             strings -a "$f" | grep -E 'fillModeNonSolid|extendedDynamicState3PolygonMode|No adapters found|Vulkan 1.3|Adreno|KGSL|libgtavvk|DXVK' || true
           done < report/arm64-libs.txt | tee report/relevant-strings.txt
 
-      - name: Analyze AArch64 references to fillModeNonSolid
+      - name: Locate fillModeNonSolid references
         run: |
           set -euo pipefail
-          cat > analyze.py <<'PY'
-          import json, os, re
-          from elftools.elf.elffile import ELFFile
-          from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
-          out=[]
-          needle=b"fillModeNonSolid\x00"
+          python3 - <<'PY' | tee report/fillmode-search.txt
+          import os
+          needle=b"fillModeNonSolid"
           for root,_,files in os.walk("apk/lib/arm64-v8a"):
               for fn in files:
-                  if not fn.endswith(".so"): continue
-                  path=os.path.join(root,fn)
-                  item={"file":path,"matches":[],"error":None}
-                  try:
-                      with open(path,"rb") as f:
-                          elf=ELFFile(f)
-                          text=elf.get_section_by_name(".text")
-                          ro=elf.get_section_by_name(".rodata")
-                          if ro is None: out.append(item); continue
-                          data=ro.data()
-                          pos=0
-                          while True:
-                              p=data.find(needle,pos)
-                              if p<0: break
-                              item["matches"].append({"rodata_offset":hex(p),"rodata_vaddr":hex(ro["sh_addr"]+p)})
-                              pos=p+1
-                          if item["matches"] and text is not None:
-                              md=Cs(CS_ARCH_ARM64,CS_MODE_ARM)
-                              md.detail=False
-                              # Diagnostic disassembly only; no binary modification.
-                              count=0
-                              for ins in md.disasm(text.data(), text["sh_addr"]):
-                                  if count>=200000: break
-                                  count+=1
-                              item["text_disassembled_instructions"]=count
-                  except Exception as e:
-                      item["error"]=repr(e)
-                  out.append(item)
-          open("report/analysis.json","w").write(json.dumps(out,indent=2))
+                  if fn.endswith(".so"):
+                      p=os.path.join(root,fn)
+                      b=open(p,"rb").read()
+                      hits=[]
+                      pos=0
+                      while True:
+                          i=b.find(needle,pos)
+                          if i<0: break
+                          hits.append(hex(i)); pos=i+1
+                      if hits: print(p, "offsets=", ",".join(hits))
           PY
-          python3 analyze.py
-          cat report/analysis.json
-          echo "=== Relevant strings ==="
-          cat report/relevant-strings.txt || true
 
       - name: Upload analysis
         uses: actions/upload-artifact@v4
