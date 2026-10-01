@@ -16,23 +16,33 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+
       - name: Resolve and download source APK
         env:
           SOURCE_URL: ${{ inputs.apk_url }}
         run: |
           set -euo pipefail
-          rm -rf apk patched report
+          rm -rf apk patched report rebuilt.apk rebuilt-unsigned.apk rebuilt-aligned.apk
           mkdir -p apk patched report
           url="$SOURCE_URL"
+
           if [[ "$url" == https://gofile.io/d/* ]]; then
             code="${url##*/}"
-            acct="$(curl -fsSL -A 'Mozilla/5.0' https://api.gofile.io/createAccount)"
+            ua='Mozilla/5.0'
+            lang='en-US'
+            acct="$(curl -fsSL -A "$ua" -X POST https://api.gofile.io/accounts)"
             token="$(printf '%s' "$acct" | jq -r '.data.token')"
             test -n "$token" && test "$token" != null
-            meta="$(curl -fsSL -A 'Mozilla/5.0' --get https://api.gofile.io/getContent               --data-urlencode "contentId=$code"               --data-urlencode "token=$token"               --data-urlencode "websiteToken=12345"               --data-urlencode "cache=true")"
-            url="$(printf '%s' "$meta" | jq -r '.data.contents | to_entries[] | select(.value.name=="XHYN-V-final.apk") | .value.directLink // .value.link' | head -n1)"
+
+            bucket="$(( $(date +%s) / 14400 ))"
+            wt="$(printf '%s::%s::%s::%s::5d4f7g8sd45fsd' "$ua" "$lang" "$token" "$bucket" | sha256sum | cut -d' ' -f1)"
+
+            meta="$(curl -fsSL -A "$ua" --get "https://api.gofile.io/contents/$code"               -H "Authorization: Bearer $token"               -H "X-Website-Token: $wt"               -H "X-BL: $lang"               --data-urlencode "cache=true")"
+
+            url="$(printf '%s' "$meta" | jq -r '.data.children[]? | select(.name=="XHYN-V-final.apk") | (.link // .directLink)' | head -n1)"
             test -n "$url" && test "$url" != null
           fi
+
           echo "Resolved source: $url"
           curl -L --fail --retry 5 --retry-delay 3 -A 'Mozilla/5.0' "$url" -o input.apk
           file input.apk | tee report/input-file.txt
@@ -40,11 +50,13 @@ jobs:
           unzip -tq input.apk
           unzip -q input.apk -d apk
           cp -a apk/. patched/
+
           find apk/lib/arm64-v8a -type f -name '*.so' -print | sort | tee report/native-libs.txt
           grep -R -a -l 'fillModeNonSolid' apk/lib/arm64-v8a > report/fillmode-files.txt || true
           while IFS= read -r f; do
             strings -a "$f" | grep -E 'fillModeNonSolid|No adapters found|Failed to initialize DXVK|Adreno|KGSL|DXVK' || true
           done < report/native-libs.txt | tee report/relevant-strings.txt
+
       - name: Apply only verified textual DXVK requirement patch
         run: |
           set -euo pipefail
@@ -54,7 +66,8 @@ jobs:
               cp "$f" "$f.bak"
               python3 - "$f" <<'PY'
           import sys,re
-          p=sys.argv[1]; s=open(p,encoding="utf-8").read()
+          p=sys.argv[1]
+          s=open(p,encoding="utf-8").read()
           s2=re.sub(r'("fillModeNonSolid"\s*:\s*)true',r'\1false',s)
           open(p,"w",encoding="utf-8").write(s2)
           PY
@@ -63,17 +76,23 @@ jobs:
             fi
           done
           echo "textual_patch_count=$changed" | tee report/patch.txt
-          if [ "$changed" -eq 0 ]; then echo "NO_SAFE_TEXTUAL_PATCH_FOUND" | tee -a report/patch.txt; fi
+          if [ "$changed" -eq 0 ]; then
+            echo "NO_SAFE_TEXTUAL_PATCH_FOUND" | tee -a report/patch.txt
+          fi
+
       - name: Repack only if a safe textual patch was found
         run: |
           set -euo pipefail
-          if ! grep -q '^textual_patch_count=[1-9][0-9]*$' report/patch.txt; then exit 0; fi
+          if ! grep -q '^textual_patch_count=[1-9][0-9]*$' report/patch.txt; then
+            exit 0
+          fi
           (cd patched && zip -q -r -9 ../rebuilt-unsigned.apk .)
           zipalign -f 4 rebuilt-unsigned.apk rebuilt-aligned.apk
-          keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=Android Debug,O=Android,C=US' >/dev/null 2>&1
+          keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=Android Debug,O=Android,C=US' >/dev/null 2>&1 || true
           apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out rebuilt.apk rebuilt-aligned.apk
           apksigner verify --verbose rebuilt.apk
           sha256sum rebuilt.apk | tee report/rebuilt.sha256
+
       - name: Upload analysis
         uses: actions/upload-artifact@v4
         with:
