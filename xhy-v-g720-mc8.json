@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "name": "XHYN V Mali-G720 MC8",
+  "vendor": "Mesa/PanVK",
+  "library": "libvulkan_panfrost.so",
+  "architecture": "arm64-v8a",
+  "gpu": "Mali-G720 MC8",
+  "gpuId": "0xc8700010",
+  "vendorId": "0x13b5",
+  "kernelInterface": "Kbase/CSF",
+  "deviceNode": "/dev/mali0",
+  "androidApiMin": 35,
+  "vulkanApi": "1.4",
+  "sourceProject": "https://github.com/wonderkast02/panvk-g720-kbase-csf",
+  "sourceRelease": "0.1.0-beta.2",
+  "sourceSha256": "fc1d69647c071ca3fe30ae2fb450e95c91c08e90779eb32c865fa384dff5aaca",
+  "binarySha256": "126b8b6124a8677298469f520cd6c825de88b498fe93a38bd358ef3b557882d3",
+  "status": "experimental",
+  "note": "The binary is the public PanVK G720 beta artifact; XHYN V packaging does not claim Vulkan conformance or universal device compatibility."
+}
