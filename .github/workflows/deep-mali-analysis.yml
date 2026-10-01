@@ -4,21 +4,34 @@ on:
   workflow_dispatch:
     inputs:
       apk_url:
-        description: Direct APK URL
+        description: GoFile share URL or direct APK URL
         required: true
         type: string
-        default: https://store3.gofile.io/download/web/84987b15-395f-4656-bc5c-5e16d691af3c/XHYN-V-final.apk
+        default: https://gofile.io/d/X1eTDcNP
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
     steps:
-      - name: Download and validate APK
+      - name: Resolve and download APK
+        env:
+          SOURCE_URL: ${{ inputs.apk_url }}
         run: |
           set -euo pipefail
           rm -rf apk report
           mkdir -p apk report
-          curl -L --fail --retry 5 --retry-delay 3 -A 'Mozilla/5.0' "${{ inputs.apk_url }}" -o input.apk
+          url="$SOURCE_URL"
+          if [[ "$url" == https://gofile.io/d/* ]]; then
+            code="${url##*/}"
+            acct="$(curl -fsSL -A 'Mozilla/5.0' https://api.gofile.io/createAccount)"
+            token="$(printf '%s' "$acct" | jq -r '.data.token')"
+            test -n "$token" && test "$token" != null
+            meta="$(curl -fsSL -A 'Mozilla/5.0' --get https://api.gofile.io/getContent               --data-urlencode "contentId=$code"               --data-urlencode "token=$token"               --data-urlencode "websiteToken=12345"               --data-urlencode "cache=true")"
+            url="$(printf '%s' "$meta" | jq -r '.data.contents | to_entries[] | select(.value.name=="XHYN-V-final.apk") | .value.directLink // .value.link' | head -n1)"
+            test -n "$url" && test "$url" != null
+          fi
+          echo "Resolved source: $url"
+          curl -L --fail --retry 5 --retry-delay 3 -A 'Mozilla/5.0' "$url" -o input.apk
           file input.apk
           test "$(stat -c%s input.apk)" -gt 1000000
           unzip -tq input.apk
@@ -27,9 +40,7 @@ jobs:
           find apk/lib/arm64-v8a -type f -name '*.so' -print | sort | tee report/arm64-libs.txt
 
       - name: Install analysis tools
-        run: |
-          set -euo pipefail
-          python3 -m pip install --break-system-packages pyelftools capstone
+        run: python3 -m pip install --break-system-packages pyelftools capstone
 
       - name: Scan native libraries
         run: |
@@ -47,10 +58,7 @@ jobs:
           for root,_,files in os.walk("apk/lib/arm64-v8a"):
               for fn in files:
                   if fn.endswith(".so"):
-                      p=os.path.join(root,fn)
-                      b=open(p,"rb").read()
-                      hits=[]
-                      pos=0
+                      p=os.path.join(root,fn); b=open(p,"rb").read(); hits=[]; pos=0
                       while True:
                           i=b.find(needle,pos)
                           if i<0: break
