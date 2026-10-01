@@ -1,0 +1,107 @@
+name: Inspect and Repack XHYN APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Direct APK URL"
+        required: true
+        type: string
+        default: "https://tmpfiles.org/dl/1790880498.08dfc23730a4071d/wuAUAemmwhea/xhyn-v-final.apk"
+
+jobs:
+  inspect-and-repack:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 2 "${{ inputs.apk_url }}" -o input.apk
+          test -s input.apk
+          sha256sum input.apk
+
+      - name: Install Android build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip apksigner aapt2 file binutils
+
+      - name: Extract APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf apk
+          mkdir apk
+          unzip -q input.apk -d apk
+          echo "APK contents:"
+          find apk -maxdepth 3 -type f | sort | sed -n '1,250p'
+          echo "Native libraries:"
+          find apk -type f -name '*.so' -print | sort
+
+      - name: Inspect Mali/DXVK paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p report
+          {
+            echo "=== APK metadata ==="
+            aapt2 dump badging input.apk | head -n 20 || true
+            echo
+            echo "=== Relevant strings in native libraries ==="
+            find apk -type f -name '*.so' -print0 | while IFS= read -r -d '' f; do
+              echo "--- $f ---"
+              strings -a "$f" | grep -Ei 'fillModeNonSolid|extendedDynamicState3PolygonMode|No adapters found|Vulkan 1.3|Adreno|KGSL|libgtavvk|dxvk|custom driver|Mali-G720' | head -n 120 || true
+            done
+            echo
+            echo "=== DXVK/config candidates ==="
+            find apk -type f \( -iname '*.json' -o -iname '*.conf' -o -iname '*.ini' -o -iname '*.toml' \) -print0 | while IFS= read -r -d '' f; do
+              grep -IlEi 'fillModeNonSolid|dxvk|vulkan|Adreno|KGSL|custom driver' "$f" 2>/dev/null && echo "MATCH: $f" || true
+            done
+          } | tee report/inspection.txt
+
+      - name: Prepare safe patch candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p patched
+          cp -a apk/. patched/
+          changed=0
+
+          # Only patch an explicit textual DXVK requirement if the APK actually contains it.
+          while IFS= read -r -d '' f; do
+            if grep -q 'fillModeNonSolid' "$f" 2>/dev/null; then
+              cp "$f" "$f.bak"
+              sed -i 's/"fillModeNonSolid"[[:space:]]*:[[:space:]]*true/"fillModeNonSolid": false/g' "$f"
+              if ! cmp -s "$f" "$f.bak"; then changed=1; fi
+              rm -f "$f.bak"
+            fi
+          done < <(find patched -type f -name '*.json' -print0)
+
+          echo "textual_patch_changed=$changed" | tee report/patch.txt
+          if [ "$changed" -eq 0 ]; then
+            echo "No safe textual fillModeNonSolid requirement was found; native binaries are left untouched." | tee -a report/patch.txt
+          fi
+
+      - name: Repack and sign
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f rebuilt-unsigned.apk rebuilt.apk
+          (cd patched && zip -q -r9 ../rebuilt-unsigned.apk .)
+          keytool -genkeypair -v -keystore debug.keystore -storepass android -keypass android             -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000             -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+          apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android             --out rebuilt.apk rebuilt-unsigned.apk
+          apksigner verify --verbose rebuilt.apk
+          sha256sum rebuilt.apk
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xhyn-apk-inspection-and-repack
+          path: |
+            input.apk
+            rebuilt.apk
+            report/inspection.txt
+            report/patch.txt
+          retention-days: 7
