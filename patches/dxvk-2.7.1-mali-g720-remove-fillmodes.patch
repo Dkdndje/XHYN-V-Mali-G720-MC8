@@ -1,0 +1,9 @@
+diff --git a/VP_DXVK_requirements.json b/VP_DXVK_requirements.json
+--- a/VP_DXVK_requirements.json
++++ b/VP_DXVK_requirements.json
+@@
+-                        "fillModeNonSolid": true,
+                         "sampleRateShading": true,
+@@
+-                        "fillModeNonSolid": true,
+                         "fullDrawIndexUint32": true,
